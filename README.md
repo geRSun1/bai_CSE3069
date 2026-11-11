@@ -1,11 +1,8 @@
 ## File trong repo này
 - `docker-compose.yml` — Cấu hình dựng HiveMQ MQTT Broker bằng Docker Compose (đã tách khóa bí mật sang `.env` và đưa vào `.gitignore`)
-- `firmware/` — Mã nguồn FreeRTOS cho ESP32 tách 3 Task độc lập và Queue giới hạn 30 bản ghi (`sketch_nov11a.ino`)
-- `topic_payload.md` — Tài liệu mô tả quy ước đặt tên Topic và cấu trúc bản tin JSON Payload
+- `sketch_nov11a.ino` — Mã nguồn FreeRTOS cho ESP32 tách 3 Task độc lập và Queue giới hạn 30 bản ghi (`sketch_nov11a.ino`)a.onp
 - `task_queue.png` — Sơ đồ kiến trúc triển khai hệ thống, phân bổ Dual-Core, luồng Task và Queue trên ESP32
-- `log_10min.txt` — Log nhận dữ liệu MQTT liên tục trong 10 phút từ thiết bị ESP32 thật
-- `log_disconnect.txt` — Log thực nghiệm ngắt kết nối Broker có chủ đích và kiểm chứng hàng đợi Queue + vòng điều khiển an toàn
-
+- `mqtt_telemetry_log.json` — Log nhận dữ liệu MQTT liên tục trong 10 phút từ thiết bị ESP32 thật
 ---
 
 ## 4.1 Payload thực tế
@@ -19,7 +16,7 @@ Dưới đây là bản tin JSON thực tế thu thập được từ cảm bi�
 - **Bản tin khi cảm biến bị ngắt kết nối hoặc đọc lỗi `NaN` (`valid: false`):**
 
 
-<img width="520" height="35" alt="image" src="https://github.com/user-attachments/assets/fde757e6-ae9b-40c6-80b1-b001c86b0b46" />
+<img width="805" height="12" alt="image" src="https://github.com/user-attachments/assets/67fd0540-766a-4cb7-b7ef-f0613513b019" />
 
 
 **Giải thích chi tiết từng trường trong Payload:**
@@ -34,22 +31,51 @@ Dưới đây là bản tin JSON thực tế thu thập được từ cảm bi�
 ---
 
 ## 4.2 Task và queue
-![Sơ đồ Task và Queue FreeRTOS trên ESP32](task_queue.png)
+<img width="1080" height="1920" alt="image" src="https://github.com/user-attachments/assets/4daf01b4-96aa-43db-b296-b4d9b36a6d15" />
 
-1. **Phân công nhiệm vụ các Task và nơi triển khai:**
-   - **`TaskSafetyControl` (Ghim trên `Core 1`, Mức ưu tiên cao nhất = `3`, Chu kỳ `100 ms`):** Chuyên trách vận hành máy trạng thái an toàn (FSM kế thừa Bài 3: `DỪNG` / `CHẠY` / `LỖI`), lắng nghe cờ ngắt ngoài (ISR) từ nút nhấn dừng khẩn cấp (`GPIO 27`) và điều khiển trực tiếp xung PWM động cơ/máy bơm (`GPIO 26`).
-   - **`TaskSensorRead` (Ghim trên `Core 1`, Mức ưu tiên = `2`, Chu kỳ `2000 ms`):** Đọc nhiệt độ/độ ẩm từ cảm biến DHT11 (`GPIO 14`) đúng chu kỳ cố định $2000\text{ ms}$ bằng `vTaskDelayUntil()`, kiểm tra `isnan()`, đóng gói vào cấu trúc `SensorPacket` và đẩy vào hàng đợi `telemetryQueue`.
-   - **`TaskMQTTPublish` (Ghim trên `Core 0`, Mức ưu tiên = `1`):** Chuyên trách duy trì kết nối Wi-Fi và MQTT TCP tới **HiveMQ Broker** (triển khai trên PC qua Docker Compose tại địa chỉ `192.168.100.7:1883`), lấy từng gói tin từ `telemetryQueue`, đóng gói thành chuỗi JSON và publish lên topic `nhom12/node01/telemetry`.
 
-2. **Cơ chế giao tiếp qua Queue và Chính sách khi Queue đầy:**
-   - **Kích thước giới hạn:** Hàng đợi `telemetryQueue` được khởi tạo bằng `xQueueCreate(30, sizeof(SensorPacket))` với sức chứa tối đa **30 bản ghi** (tương đương 60 giây lưu đệm dữ liệu khi mất kết nối tới Broker).
-   - **Chính sách khi đầy (`Drop Oldest` — Bỏ bản ghi cũ nhất):** Trước khi đẩy dữ liệu mới vào Queue, `TaskSensorRead` kiểm tra số ô trống bằng `uxQueueSpacesAvailable(telemetryQueue)`. Nếu hàng đợi đã đầy (`30/30`), Task sẽ gọi `xQueueReceive(telemetryQueue, &droppedPkt, 0)` để rút bỏ 1 bản ghi cũ nhất ở đầu hàng đợi ra, in cảnh báo `[QUEUE-FULL]` qua Serial, rồi mới đẩy bản ghi mới nhất vào cuối hàng đợi (`xQueueSend(..., 0)`). Chính sách này giúp `TaskSensorRead` không bao giờ bị chặn (non-blocking) và đảm bảo khi mạng có lại, Broker nhận được 30 mẫu đo gần với thời điểm hiện tại nhất.
+## 1. Phân bổ tác vụ trên 2 nhân CPU của ESP32 (Dual-Core Architecture)
+ESP32 sở hữu 2 nhân xử lý (`Core 0` và `Core 1`). Hệ thống tận dụng hàm `xTaskCreatePinnedToCore()` để ghim các tác vụ độc lập vào từng nhân nhằm triệt tiêu hiện tượng xung đột tài nguyên và loại bỏ độ trễ do mạng:
 
-3. **Vì sao thời gian chờ của Task an toàn không được phụ thuộc vô hạn vào MQTT?**
-   - Giao thức MQTT hoạt động qua mạng Wi-Fi và TCP/IP nên luôn tiềm ẩn độ trễ không xác định (non-deterministic): khi sập Broker hoặc nhiễu sóng Wi-Fi, hàm `mqttClient.connect()` có thể chặn (block) luồng thực thi từ vài giây đến hàng chục giây.
-   - Nếu gộp chung vòng kiểm tra an toàn vào cùng một `loop()` với MQTT hoặc để `TaskSafetyControl` chờ kết nối mạng, toàn bộ hệ thống bảo vệ sẽ bị "đóng băng" khi đứt mạng: người vận hành nhấn nút dừng khẩn cấp hoặc xảy ra lỗi quá thời gian (Timeout) nhưng cơ cấu chấp hành vẫn không thể ngắt PWM, dẫn đến nguy cơ tràn nước hoặc hư hại phần cứng nhà kính. Nhờ tách riêng `TaskSafetyControl` lên `Core 1` với mức ưu tiên cao nhất (`Priority 3`) và không phụ thuộc bất kỳ lệnh mạng nào, vòng điều khiển an toàn luôn phản hồi tức thời ($\le 100\text{ ms}$) trong mọi sự cố mạng.
+* **Trên `Core 1` (Nhân xử lý ứng dụng & thời gian thực):**
+  * **`TaskSafetyControl` (Mức ưu tiên = 3, Chu kỳ $100\text{ ms}$):**
+    * Có mức ưu tiên cao nhất trong toàn bộ hệ thống (`Priority 3`).
+   
+      
+  * **`TaskSensorRead` (Mức ưu tiên = 2, Chu kỳ $2000\text{ ms}$):**
+    * Tiến hành đọc số đo nhiệt độ và độ ẩm từ cảm biến **DHT11 (`GPIO 14`)** đúng định kỳ mỗi 2 giây bằng hàm `vTaskDelayUntil()`.
+    * Thực hiện kiểm tra tính hợp lệ của dữ liệu (phát hiện lỗi `NaN` để gán cờ `valid: true/false`), đóng gói thành cấu trúc `SensorPacket` rồi đẩy xuống hàng đợi `telemetryQueue`.
+
+* **Trên `Core 0` (Nhân xử lý giao thức mạng Wi-Fi & MQTT):**
+  * **`TaskMQTTPublish` (Mức ưu tiên = 1):**
+    * Có mức ưu tiên thấp nhất (`Priority 1`) và được ghim sang `Core 0` (nhân vốn phụ trách ngăn xếp Wi-Fi/TCP ngầm của ESP32).
+    * Đảm nhận nhiệm vụ duy trì liên kết mạng Wi-Fi/MQTT, lấy các gói dữ liệu từ `telemetryQueue`, định dạng thành chuỗi JSON và truyền (publish) qua giao thức TCP lên Broker. Mọi độ trễ kết nối hoặc thời gian chờ kết nối lại (`reconnect`) chỉ ảnh hưởng đến Task này trên `Core 0`, hoàn toàn không gây tác động hay chặn đứng `Core 1`.
 
 ---
+
+## 2. Cơ chế đệm dữ liệu qua Hàng đợi `telemetryQueue`
+Giữa `TaskSensorRead` (bên sản xuất dữ liệu - Producer) và `TaskMQTTPublish` (bên tiêu thụ dữ liệu - Consumer) không thực hiện truyền biến trực tiếp mà trao đổi thông qua hàng đợi FreeRTOS có giới hạn nghiêm ngặt:
+
+* **Kích thước cố định (`Size: 30`):** Sức chứa tối đa lên đến 30 bản ghi `SensorPacket` (tương đương 60 giây lưu đệm dữ liệu trong trường hợp mất kết nối Broker).
+* **Chính sách khi đầy (`Drop Oldest Policy` — Bỏ bản ghi cũ nhất):**
+  * Khi đường truyền bị ngắt hoặc Broker sập quá 60 giây, hàng đợi sẽ đạt ngưỡng tối đa (`30/30`).
+  * Lúc này, trước khi chèn mẫu đo mới vào, `TaskSensorRead` sẽ tự động rút bỏ 1 bản ghi cũ nhất ở đầu hàng đợi ra bằng hàm `xQueueReceive()`, sau đó mới chèn bản ghi mới nhất vào cuối hàng đợi bằng `xQueueSend()` với thời gian chờ bằng `0` (không gây block).
+  * Cơ chế này giúp `TaskSensorRead` không bao giờ bị treo khi Queue đầy. Ngay khi mạng phục hồi, hệ thống sẽ xả đệm và gửi ngay các mẫu đo bám sát thời điểm hiện tại nhất.
+
+---
+
+## 3. Khối Máy chủ Broker & Giám sát trên PCf
+* **HiveMQ Broker (`192.168.100.7:1883`):**
+  * Được dựng và vận hành trên máy tính cá nhân thông qua **Docker Compose**.
+  * Mở cổng TCP `1883` trong mạng LAN để tiếp nhận các bản tin JSON từ ESP32 gửi tới theo chủ đề `nhom12/node01/telemetry`.
+* **Subscriber / Web Client (`Port 8080`):**
+  * Giao diện điều khiển, Web Client của HiveMQ hoặc các tiến trình nhận tin độc lập (`mosquitto_sub` / Python Subscriber trên máy tính thứ 2) tiến hành đăng ký (`subscribe`) đúng topic `nhom12/node01/telemetry`.
+  * Nhận dữ liệu liên tục theo thời gian thực, phục vụ cho việc giám sát trực quan và ghi nhận log hệ thống trong 10 phút (`log_10min.txt`).
+
+---
+
+## 4. Khối máy Subcribe 
+* Khối máy nhận JSON bằng cách mở một công cụ/phần mềm ở trạng thái sẵn sàng Subscriber đúng cái Topic mà ESP32 đang truyền đi. Cứ mỗi lần ESP32 gửi lên, Broker sẽ lập tức "bơm" gói JSON đó đến và hiển thị trên màn hình
 
 ## 4.3 Thí nghiệm ngắt kết nối
 Thực hiện thí nghiệm kiểm chứng khả năng chịu lỗi bằng cách dừng chủ động container HiveMQ trên PC (`docker compose stop broker`) và làm nghẽn đường truyền để quan sát hành vi của hệ thống:
