@@ -1,0 +1,12 @@
+services:
+  broker:
+    image: hivemq/hivemq4:latest
+    container_name: hivemq
+    pull_policy: always
+    restart: unless-stopped
+    ports:
+      - "1883:1883"
+      - "8080:8080"
+    environment:
+      - HIVEMQ_LICENSE_KEY=${HIVEMQ_LICENSE_KEY}
+      - HIVEMQ_LOG_BASED_CLUSTERING_ENABLED=true
